@@ -253,6 +253,21 @@ const fn default_allow_audio_finish_on_pause() -> bool {
     true // Allow audio to finish naturally when paused
 }
 
+const fn default_pause_debounce_threshold() -> f64 {
+    0.05 // 50ms debounce threshold for pause state changes
+}
+
+const fn default_rapid_pause_threshold() -> u32 {
+    5 // Maximum rapid pause/resume cycles before triggering audio reset
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingAudioAction {
+    Play { button: Button, player2: bool, push: bool, timestamp: Instant },
+    Stop { immediate: bool },
+    Reset,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
 pub enum TimingMode {
     #[default]
@@ -364,6 +379,12 @@ pub struct Config {
     pub timing_mode: TimingMode,
     #[serde(default = "default_allow_audio_finish_on_pause")]
     pub allow_audio_finish_on_pause: bool,
+    #[serde(default = "default_pause_debounce_threshold")]
+    pub pause_debounce_threshold: f64,
+    #[serde(default = "default_rapid_pause_threshold")]
+    pub rapid_pause_threshold: u32,
+    #[serde(default = "bool::default")]
+    pub enable_audio_system_recovery: bool,
     #[serde(default = "float_one")]
     pub ui_scale: f32,
     #[serde(default)]
@@ -425,6 +446,9 @@ impl Default for Config {
             input_latency_compensation: default_input_latency_compensation(),
             timing_mode: TimingMode::default(),
             allow_audio_finish_on_pause: default_allow_audio_finish_on_pause(),
+            pause_debounce_threshold: default_pause_debounce_threshold(),
+            rapid_pause_threshold: default_rapid_pause_threshold(),
+            enable_audio_system_recovery: true,
             ui_scale: 1.0,
             toast_visibility: ToastVisibility::default(),
         }
@@ -562,9 +586,14 @@ pub struct Bot {
     pub dead_timer: f32,
     pub dead_timer_limit: f32,
     pub devices: Arc<Mutex<Vec<String>>>,
-    // Pause-aware audio management
+    // Enhanced pause-aware audio management
     pub is_game_paused: bool,
     pub pause_detected_time: Instant,
+    pub pause_state_debounce_timer: Instant,
+    pub last_pause_state: bool,
+    pub rapid_pause_resume_count: u32,
+    pub audio_system_needs_reset: bool,
+    pub pending_audio_actions: Vec<PendingAudioAction>,
 }
 
 impl Default for Bot {
@@ -617,9 +646,14 @@ impl Default for Bot {
             dead_timer: f32::NAN,
             dead_timer_limit: 0.0,
             devices: Arc::new(Mutex::new(vec![])),
-            // Initialize pause-aware audio management
+            // Initialize enhanced pause-aware audio management
             is_game_paused: false,
             pause_detected_time: now,
+            pause_state_debounce_timer: now,
+            last_pause_state: false,
+            rapid_pause_resume_count: 0,
+            audio_system_needs_reset: false,
+            pending_audio_actions: Vec::new(),
         }
     }
 }
@@ -989,6 +1023,15 @@ impl Bot {
         self.last_input_time = now;
         self.audio_playback_time = 0.0;
         self.sync_time_cache = 0.0;
+
+        // Reset enhanced pause-aware audio management
+        self.is_game_paused = false;
+        self.pause_detected_time = now;
+        self.pause_state_debounce_timer = now;
+        self.last_pause_state = false;
+        self.rapid_pause_resume_count = 0;
+        self.audio_system_needs_reset = false;
+        self.pending_audio_actions.clear();
     }
 
     pub fn on_exit(&mut self) {
@@ -1044,6 +1087,25 @@ impl Bot {
         // Update enhanced timing state for better recording synchronization
         self.update_timing_state();
 
+        // Check and recover audio system if needed
+        self.check_and_recover_audio_system();
+
+        // Clean up old pending audio actions (older than 500ms)
+        let now = Instant::now();
+        self.pending_audio_actions.retain(|action| {
+            match action {
+                PendingAudioAction::Play { timestamp, .. } => {
+                    timestamp.elapsed().as_millis() < 500
+                }
+                _ => true, // Keep non-play actions
+            }
+        });
+
+        // Reset rapid pause counter if enough time has passed without rapid changes
+        if self.pause_state_debounce_timer.elapsed().as_secs_f64() > 1.0 {
+            self.rapid_pause_resume_count = 0;
+        }
+
         if !self.dead_timer.is_nan() {
             self.dead_timer += dt;
             if self.dead_timer >= self.dead_timer_limit {
@@ -1059,12 +1121,26 @@ impl Bot {
             return;
         }
 
-        // Check if game is paused and feature is enabled
+        // Enhanced pause handling with action queuing
         if self.is_game_paused && self.conf.allow_audio_finish_on_pause {
-            // During pause, prevent new audio from starting but allow current audio to finish
-            log::trace!("Skipping new audio during pause - allowing current sounds to finish");
+            if self.conf.enable_audio_system_recovery {
+                // Queue the action for later processing when resumed
+                self.pending_audio_actions.push(PendingAudioAction::Play {
+                    button,
+                    player2,
+                    push,
+                    timestamp: Instant::now(),
+                });
+                log::trace!("Queued audio action during pause for later processing");
+            } else {
+                // Original behavior: skip new audio during pause
+                log::trace!("Skipping new audio during pause - allowing current sounds to finish");
+            }
             return;
         }
+
+        // Check if audio system needs recovery
+        self.check_and_recover_audio_system();
 
         // Record input event for instant response tracking
         self.record_input_event();
@@ -1285,17 +1361,8 @@ impl Bot {
         let game_time_delta = raw_game_time - self.last_game_time;
         let is_paused = real_elapsed > self.conf.pause_detection_threshold && game_time_delta < real_elapsed * 0.5;
 
-        // Update pause state for audio management
-        if is_paused && !self.is_game_paused {
-            // Game just paused
-            self.is_game_paused = true;
-            self.pause_detected_time = current_real_time;
-            log::debug!("Game pause detected - allowing current audio to finish");
-        } else if !is_paused && self.is_game_paused {
-            // Game just resumed
-            self.is_game_paused = false;
-            log::debug!("Game resumed - normal audio behavior restored");
-        }
+        // Enhanced pause state management with debouncing
+        self.update_pause_state_with_debouncing(is_paused, current_real_time);
 
         if is_paused {
             // During pause, maintain the last known synchronized time
@@ -1363,17 +1430,8 @@ impl Bot {
 
         let is_paused = real_delta > self.conf.pause_detection_threshold && game_delta < real_delta * 0.5;
 
-        // Update pause state for audio management (for enhanced timing system)
-        if is_paused && !self.is_game_paused {
-            // Game just paused
-            self.is_game_paused = true;
-            self.pause_detected_time = current_real_time;
-            log::debug!("Game pause detected (enhanced timing) - allowing current audio to finish");
-        } else if !is_paused && self.is_game_paused {
-            // Game just resumed
-            self.is_game_paused = false;
-            log::debug!("Game resumed (enhanced timing) - normal audio behavior restored");
-        }
+        // Enhanced pause state management with debouncing (for enhanced timing system)
+        self.update_pause_state_with_debouncing(is_paused, current_real_time);
 
         if is_paused {
             // Game was likely paused, accumulate pause compensation
@@ -1383,6 +1441,55 @@ impl Bot {
         // Update state for next iteration
         self.last_game_time = raw_game_time;
         self.last_real_time = current_real_time;
+    }
+
+    /// Enhanced pause state management with debouncing and rapid change detection
+    fn update_pause_state_with_debouncing(&mut self, is_paused: bool, current_time: Instant) {
+        let debounce_elapsed = current_time.duration_since(self.pause_state_debounce_timer).as_secs_f64();
+
+        // Check if we should apply debouncing
+        let should_debounce = debounce_elapsed < self.conf.pause_debounce_threshold;
+
+        // Detect rapid pause/resume cycles
+        if is_paused != self.last_pause_state && !should_debounce {
+            self.rapid_pause_resume_count += 1;
+            self.pause_state_debounce_timer = current_time;
+
+            // Check if we've exceeded the rapid pause threshold
+            if self.rapid_pause_resume_count >= self.conf.rapid_pause_threshold {
+                log::warn!("Rapid pause/resume cycles detected ({}), marking audio system for reset",
+                          self.rapid_pause_resume_count);
+                self.audio_system_needs_reset = true;
+                self.rapid_pause_resume_count = 0; // Reset counter
+            }
+        }
+
+        // Only update pause state if not debouncing or if it's been stable
+        if !should_debounce || is_paused == self.last_pause_state {
+            if is_paused && !self.is_game_paused {
+                // Game just paused
+                self.is_game_paused = true;
+                self.pause_detected_time = current_time;
+                log::debug!("Game pause detected - allowing current audio to finish");
+
+                // If audio system recovery is enabled, handle pause more gracefully
+                if self.conf.enable_audio_system_recovery && self.conf.allow_audio_finish_on_pause {
+                    // Don't immediately stop sounds, let them finish naturally
+                    log::debug!("Allowing current audio to finish during pause");
+                }
+            } else if !is_paused && self.is_game_paused {
+                // Game just resumed
+                self.is_game_paused = false;
+                log::debug!("Game resumed - normal audio behavior restored");
+
+                // Process any pending audio actions that were queued during pause
+                if self.conf.enable_audio_system_recovery {
+                    self.process_pending_audio_actions();
+                }
+            }
+
+            self.last_pause_state = is_paused;
+        }
     }
 
     /// Basic pause detection for standard timing system
@@ -1414,17 +1521,8 @@ impl Bot {
 
         let is_paused = real_delta > self.conf.pause_detection_threshold && game_delta < real_delta * 0.5;
 
-        // Update pause state for audio management
-        if is_paused && !self.is_game_paused {
-            // Game just paused
-            self.is_game_paused = true;
-            self.pause_detected_time = current_real_time;
-            log::debug!("Game pause detected (basic timing) - allowing current audio to finish");
-        } else if !is_paused && self.is_game_paused {
-            // Game just resumed
-            self.is_game_paused = false;
-            log::debug!("Game resumed (basic timing) - normal audio behavior restored");
-        }
+        // Enhanced pause state management with debouncing (for basic timing system)
+        self.update_pause_state_with_debouncing(is_paused, current_real_time);
 
         // Update state for next iteration
         self.last_game_time = raw_game_time;
@@ -2296,10 +2394,19 @@ impl Bot {
                     log::info!("Timing Diagnostics:\n{}", diagnostics);
                     self.toasts.lock().add(Toast::info("Timing diagnostics logged to console"));
                 }
+
+                // Show audio system diagnostics button
+                if ui.button("Show Audio System Status").clicked() {
+                    let audio_status = self.get_audio_system_status();
+                    log::info!("Audio System Status:\n{}", audio_status);
+                    self.toasts.lock().add(Toast::info("Audio system status logged to console"));
+                }
             });
 
-            // Pause-aware audio controls
+            // Enhanced pause-aware audio controls
             ui.separator();
+            ui.label(RichText::new("Pause-Aware Audio System").strong());
+
             help_text(
                 ui,
                 "When enabled, currently playing clickpack audio will continue to play naturally when the game is paused,\n\
@@ -2309,6 +2416,48 @@ impl Bot {
                     ui.checkbox(&mut self.conf.allow_audio_finish_on_pause, "Allow Audio to Finish on Pause");
                 },
             );
+
+            help_text(
+                ui,
+                "Enables advanced audio system recovery features that handle rapid pause/resume cycles more gracefully.\n\
+                This includes action queuing during pauses and automatic audio system reset when needed.",
+                |ui| {
+                    ui.checkbox(&mut self.conf.enable_audio_system_recovery, "Enable Audio System Recovery");
+                },
+            );
+
+            ui.add_enabled_ui(self.conf.enable_audio_system_recovery, |ui| {
+                help_text(
+                    ui,
+                    "Time threshold for debouncing pause state changes to prevent audio instability.\n\
+                    Lower values are more responsive but may cause issues with rapid pause/resume cycles.",
+                    |ui| {
+                        drag_value(
+                            ui,
+                            &mut self.conf.pause_debounce_threshold,
+                            "Pause Debounce Threshold (s)",
+                            0.01..=0.5,
+                            "",
+                        );
+                    },
+                );
+
+                help_text(
+                    ui,
+                    "Maximum number of rapid pause/resume cycles before triggering an audio system reset.\n\
+                    This prevents audio system instability during very rapid state changes.",
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                DragValue::new(&mut self.conf.rapid_pause_threshold)
+                                    .clamp_range(3..=20)
+                                    .speed(0.1),
+                            );
+                            ui.label("Rapid Pause Threshold");
+                        });
+                    },
+                );
+            });
             help_text(
                 ui,
                 "Plays platformer left/right sounds even if your clickpack doesn't have them",
@@ -2626,6 +2775,151 @@ impl Bot {
         self.conf.play_noise = false;
         self.play_noise();
         self.conf.play_noise = prev_play_noise;
+    }
+
+    /// Reset the audio system to recover from issues during rapid pause/resume cycles
+    fn reset_audio_system(&mut self) {
+        log::info!("Resetting audio system due to rapid pause/resume cycles");
+
+        // Stop all currently playing sounds immediately
+        self.stop_all_sounds_immediately();
+
+        // Reinitialize the mixer
+        if !self.conf.use_fmod {
+            self.maybe_init_kittyaudio();
+        }
+
+        // Reset audio state
+        self.audio_system_needs_reset = false;
+        self.rapid_pause_resume_count = 0;
+        self.pending_audio_actions.clear();
+
+        // Restart noise if it was playing
+        self.play_noise();
+
+        log::info!("Audio system reset completed");
+    }
+
+    /// Stop all sounds immediately without seeking to end (for emergency reset)
+    fn stop_all_sounds_immediately(&mut self) {
+        if !self.conf.use_fmod {
+            // Create a new mixer to immediately stop all sounds
+            let old_mixer = std::mem::replace(&mut self.mixer, Mixer::new());
+            drop(old_mixer); // This will stop all sounds immediately
+        }
+
+        // Reset noise sound handle
+        self.noise_sound = None;
+    }
+
+    /// Process pending audio actions that were queued during pause states
+    fn process_pending_audio_actions(&mut self) {
+        if self.pending_audio_actions.is_empty() {
+            return;
+        }
+
+        log::debug!("Processing {} pending audio actions", self.pending_audio_actions.len());
+
+        let actions = std::mem::take(&mut self.pending_audio_actions);
+        let mut processed_count = 0;
+
+        for action in actions {
+            match action {
+                PendingAudioAction::Play { button, player2, push, timestamp } => {
+                    // Only process recent actions (within 150ms for better responsiveness)
+                    if timestamp.elapsed().as_millis() < 150 {
+                        unsafe { self.on_action(button, player2, push); }
+                        processed_count += 1;
+                    }
+                }
+                PendingAudioAction::Stop { immediate } => {
+                    if immediate {
+                        self.stop_all_sounds_immediately();
+                    } else {
+                        self.stop_noise();
+                    }
+                    processed_count += 1;
+                }
+                PendingAudioAction::Reset => {
+                    self.reset_audio_system();
+                    processed_count += 1;
+                }
+            }
+        }
+
+        if processed_count > 0 {
+            log::debug!("Processed {} audio actions after resume", processed_count);
+        }
+    }
+
+    /// Check if audio system recovery is needed and perform it
+    fn check_and_recover_audio_system(&mut self) {
+        if !self.conf.enable_audio_system_recovery {
+            return;
+        }
+
+        if self.audio_system_needs_reset {
+            self.reset_audio_system();
+        }
+
+        // Process any pending actions
+        self.process_pending_audio_actions();
+    }
+
+    /// Get comprehensive audio system status for diagnostics
+    fn get_audio_system_status(&self) -> String {
+        let mut status = String::new();
+
+        status.push_str("=== Audio System Status ===\n");
+        status.push_str(&format!("Game Paused: {}\n", self.is_game_paused));
+        status.push_str(&format!("Audio System Needs Reset: {}\n", self.audio_system_needs_reset));
+        status.push_str(&format!("Rapid Pause/Resume Count: {}\n", self.rapid_pause_resume_count));
+        status.push_str(&format!("Pending Audio Actions: {}\n", self.pending_audio_actions.len()));
+        status.push_str(&format!("Last Pause State: {}\n", self.last_pause_state));
+
+        let debounce_elapsed = self.pause_state_debounce_timer.elapsed().as_millis();
+        status.push_str(&format!("Debounce Timer Elapsed: {}ms\n", debounce_elapsed));
+
+        let pause_elapsed = self.pause_detected_time.elapsed().as_millis();
+        status.push_str(&format!("Time Since Last Pause Detection: {}ms\n", pause_elapsed));
+
+        status.push_str("\n=== Configuration ===\n");
+        status.push_str(&format!("Allow Audio Finish on Pause: {}\n", self.conf.allow_audio_finish_on_pause));
+        status.push_str(&format!("Enable Audio System Recovery: {}\n", self.conf.enable_audio_system_recovery));
+        status.push_str(&format!("Pause Detection Threshold: {:.3}s\n", self.conf.pause_detection_threshold));
+        status.push_str(&format!("Pause Debounce Threshold: {:.3}s\n", self.conf.pause_debounce_threshold));
+        status.push_str(&format!("Rapid Pause Threshold: {}\n", self.conf.rapid_pause_threshold));
+
+        status.push_str("\n=== Audio Engine ===\n");
+        status.push_str(&format!("Using FMOD: {}\n", self.conf.use_fmod));
+        status.push_str(&format!("Buffer Size: {}\n", self.conf.buffer_size));
+        status.push_str(&format!("Cut Sounds: {}\n", self.conf.cut_sounds));
+        status.push_str(&format!("Noise Sound Active: {}\n", self.noise_sound.is_some()));
+
+        if !self.conf.use_fmod {
+            let renderer_guard = self.mixer.renderer.guard();
+            status.push_str(&format!("Active Sounds: {}\n", renderer_guard.sounds.len()));
+        }
+
+        status
+    }
+
+    /// Force immediate audio system recovery (emergency reset)
+    /// This can be called externally when audio issues are detected
+    pub fn force_audio_system_recovery(&mut self) {
+        log::warn!("Forcing immediate audio system recovery");
+
+        // Mark for immediate reset
+        self.audio_system_needs_reset = true;
+        self.rapid_pause_resume_count = self.conf.rapid_pause_threshold;
+
+        // Clear all pending actions to prevent conflicts
+        self.pending_audio_actions.clear();
+
+        // Perform immediate recovery
+        self.check_and_recover_audio_system();
+
+        log::info!("Emergency audio system recovery completed");
     }
 
     fn load_clickpack_thread(
@@ -3013,16 +3307,20 @@ mod tests {
     }
 
     #[test]
-    fn test_pause_aware_audio() {
+    fn test_enhanced_pause_aware_audio() {
         let mut bot = Bot::default();
         bot.conf.use_ingame_time = true;
         bot.conf.allow_audio_finish_on_pause = true;
+        bot.conf.enable_audio_system_recovery = true;
         bot.conf.pause_detection_threshold = 0.05; // 50ms threshold
+        bot.conf.pause_debounce_threshold = 0.03; // 30ms debounce
+        bot.conf.rapid_pause_threshold = 3;
 
         bot.on_init(0);
 
         // Initially not paused
         assert!(!bot.is_game_paused, "Should not be paused initially");
+        assert_eq!(bot.rapid_pause_resume_count, 0, "Should have no rapid pause count initially");
 
         // Simulate pause detection
         bot.last_game_time = 1.0;
@@ -3034,6 +3332,38 @@ mod tests {
 
         // Should now be detected as paused
         assert!(bot.is_game_paused, "Should detect pause state");
+
+        // Test rapid pause/resume detection
+        for _ in 0..4 {
+            // Simulate rapid state changes
+            std::thread::sleep(Duration::from_millis(10));
+            bot.update_pause_state_with_debouncing(!bot.is_game_paused, Instant::now());
+        }
+
+        // Should trigger audio system reset due to rapid changes
+        assert!(bot.audio_system_needs_reset || bot.rapid_pause_resume_count >= bot.conf.rapid_pause_threshold,
+                "Should detect rapid pause/resume cycles");
+
+        // Test pending action queuing
+        bot.is_game_paused = true;
+        bot.pending_audio_actions.push(PendingAudioAction::Play {
+            button: crate::clickpack::Button::Jump,
+            player2: false,
+            push: true,
+            timestamp: Instant::now(),
+        });
+
+        assert_eq!(bot.pending_audio_actions.len(), 1, "Should have queued action");
+
+        // Test audio system recovery
+        bot.check_and_recover_audio_system();
+
+        // After recovery, system should be stable
+        if bot.audio_system_needs_reset {
+            bot.reset_audio_system();
+            assert!(!bot.audio_system_needs_reset, "Audio system should be reset");
+            assert_eq!(bot.rapid_pause_resume_count, 0, "Rapid pause count should be reset");
+        }
 
         // Simulate resume
         bot.last_real_time = Instant::now() - Duration::from_millis(50); // 50ms ago
