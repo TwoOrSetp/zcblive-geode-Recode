@@ -1325,6 +1325,8 @@ impl Bot {
     /// This should be called regularly to maintain accurate timing data
     fn update_timing_state(&mut self) {
         if !self.conf.use_ingame_time || !self.conf.enhanced_recording_sync {
+            // Even if enhanced sync is disabled, we still need to detect pauses for audio management
+            self.update_pause_state_basic();
             return;
         }
 
@@ -1359,9 +1361,69 @@ impl Bot {
         let real_delta = current_real_time.duration_since(self.last_real_time).as_secs_f64();
         let game_delta = raw_game_time - self.last_game_time;
 
-        if real_delta > self.conf.pause_detection_threshold && game_delta < real_delta * 0.5 {
+        let is_paused = real_delta > self.conf.pause_detection_threshold && game_delta < real_delta * 0.5;
+
+        // Update pause state for audio management (for enhanced timing system)
+        if is_paused && !self.is_game_paused {
+            // Game just paused
+            self.is_game_paused = true;
+            self.pause_detected_time = current_real_time;
+            log::debug!("Game pause detected (enhanced timing) - allowing current audio to finish");
+        } else if !is_paused && self.is_game_paused {
+            // Game just resumed
+            self.is_game_paused = false;
+            log::debug!("Game resumed (enhanced timing) - normal audio behavior restored");
+        }
+
+        if is_paused {
             // Game was likely paused, accumulate pause compensation
             self.pause_compensation += real_delta - game_delta;
+        }
+
+        // Update state for next iteration
+        self.last_game_time = raw_game_time;
+        self.last_real_time = current_real_time;
+    }
+
+    /// Basic pause detection for standard timing system
+    /// Used when enhanced recording sync is disabled but pause-aware audio is still needed
+    fn update_pause_state_basic(&mut self) {
+        if !self.conf.use_ingame_time || !self.conf.allow_audio_finish_on_pause {
+            return;
+        }
+
+        let current_real_time = Instant::now();
+        let raw_game_time = {
+            #[cfg(feature = "geode")]
+            {
+                self.playlayer_time
+            }
+            #[cfg(not(feature = "geode"))]
+            {
+                if !self.playlayer.is_null() {
+                    self.playlayer.time()
+                } else {
+                    return;
+                }
+            }
+        };
+
+        // Simple pause detection without the full enhanced timing system
+        let real_delta = current_real_time.duration_since(self.last_real_time).as_secs_f64();
+        let game_delta = raw_game_time - self.last_game_time;
+
+        let is_paused = real_delta > self.conf.pause_detection_threshold && game_delta < real_delta * 0.5;
+
+        // Update pause state for audio management
+        if is_paused && !self.is_game_paused {
+            // Game just paused
+            self.is_game_paused = true;
+            self.pause_detected_time = current_real_time;
+            log::debug!("Game pause detected (basic timing) - allowing current audio to finish");
+        } else if !is_paused && self.is_game_paused {
+            // Game just resumed
+            self.is_game_paused = false;
+            log::debug!("Game resumed (basic timing) - normal audio behavior restored");
         }
 
         // Update state for next iteration
@@ -1457,13 +1519,17 @@ impl Bot {
                 Audio Time: {:.3}s\n\
                 Input Compensation: {:.3}s\n\
                 Last Input: {:.3}s ago\n\
-                Instant Response: {}",
+                Instant Response: {}\n\
+                Pause-Aware Audio: {}\n\
+                Game Paused: {}",
                 timing_mode_str,
                 real_elapsed,
                 self.audio_playback_time,
                 input_compensation,
                 last_input_age,
-                self.conf.instant_audio_response
+                self.conf.instant_audio_response,
+                self.conf.allow_audio_finish_on_pause,
+                self.is_game_paused
             );
         }
 
@@ -1477,7 +1543,9 @@ impl Bot {
                 Drift: {:.3}s\n\
                 Input Compensation: {:.3}s\n\
                 Last Input: {:.3}s ago\n\
-                Instant Response: {}",
+                Instant Response: {}\n\
+                Pause-Aware Audio: {}\n\
+                Game Paused: {}",
                 timing_mode_str,
                 game_time,
                 real_elapsed,
@@ -1485,7 +1553,9 @@ impl Bot {
                 game_time - real_elapsed,
                 input_compensation,
                 last_input_age,
-                self.conf.instant_audio_response
+                self.conf.instant_audio_response,
+                self.conf.allow_audio_finish_on_pause,
+                self.is_game_paused
             );
         }
 
@@ -1512,7 +1582,9 @@ impl Bot {
             Smoothing Factor: {:.1}%\n\
             Buffer Size: {}/10\n\
             Input Buffer: {}/20\n\
-            Instant Response: {}",
+            Instant Response: {}\n\
+            Pause-Aware Audio: {}\n\
+            Game Paused: {}",
             timing_mode_str,
             game_time,
             real_elapsed,
@@ -1526,7 +1598,9 @@ impl Bot {
             self.conf.time_smoothing_factor * 100.0,
             self.time_smoothing_buffer.len(),
             self.input_timestamps.len(),
-            self.conf.instant_audio_response
+            self.conf.instant_audio_response,
+            self.conf.allow_audio_finish_on_pause,
+            self.is_game_paused
         )
     }
 
@@ -2936,6 +3010,40 @@ mod tests {
 
         // During pause, should maintain stable timing
         assert!(sync_time > 0.0, "Should maintain positive time during pause");
+    }
+
+    #[test]
+    fn test_pause_aware_audio() {
+        let mut bot = Bot::default();
+        bot.conf.use_ingame_time = true;
+        bot.conf.allow_audio_finish_on_pause = true;
+        bot.conf.pause_detection_threshold = 0.05; // 50ms threshold
+
+        bot.on_init(0);
+
+        // Initially not paused
+        assert!(!bot.is_game_paused, "Should not be paused initially");
+
+        // Simulate pause detection
+        bot.last_game_time = 1.0;
+        bot.last_real_time = Instant::now() - Duration::from_millis(200); // 200ms ago
+        bot.playlayer_time = 1.01; // Only 10ms game time passed
+
+        // Update timing state to detect pause
+        bot.update_timing_state();
+
+        // Should now be detected as paused
+        assert!(bot.is_game_paused, "Should detect pause state");
+
+        // Simulate resume
+        bot.last_real_time = Instant::now() - Duration::from_millis(50); // 50ms ago
+        bot.playlayer_time = 1.1; // Normal game time progression
+
+        // Update timing state to detect resume
+        bot.update_timing_state();
+
+        // Should now be detected as resumed
+        assert!(!bot.is_game_paused, "Should detect resume state");
     }
 
     #[test]
