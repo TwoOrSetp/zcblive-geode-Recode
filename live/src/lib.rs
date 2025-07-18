@@ -1,3 +1,5 @@
+#![allow(static_mut_refs)] // Allow static mut references for BOT global state
+
 mod bot;
 mod clickpack;
 
@@ -13,6 +15,20 @@ use bot::{Bot, BOT};
 use clickpack::Button;
 use once_cell::sync::Lazy;
 use std::{ffi::c_void, sync::Once};
+
+/// Safe wrapper for accessing the global BOT instance
+///
+/// # Safety
+/// This function provides controlled access to the global BOT static.
+/// It should only be called from single-threaded contexts or with proper
+/// synchronization to avoid data races.
+#[inline]
+unsafe fn with_bot<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Bot) -> R,
+{
+    f(&mut BOT)
+}
 
 #[cfg(not(feature = "geode"))]
 use retour::static_detour;
@@ -123,7 +139,7 @@ unsafe extern "C" fn zcblive_on_wgl_swap_buffers(hdc: HDC) {
         let _ = egui_gl_hook::paint(
             hdc,
             Box::new(|ctx| {
-                BOT.draw_ui(ctx);
+                with_bot(|bot| bot.draw_ui(ctx));
             }),
         )
         .map_err(|e| log::error!("paint() failed: {e}"));
@@ -157,7 +173,7 @@ unsafe extern "system" fn zcblive_main(_hmod: *mut c_void) -> u32 {
 unsafe extern "C" fn zcblive_initialize() {
     // wait for enter key on panics
     let panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info: &std::panic::PanicInfo<'_>| {
+    std::panic::set_hook(Box::new(move |info: &std::panic::PanicHookInfo<'_>| {
         panic_hook(info);
         let mut string = String::new();
         std::io::stdin().read_line(&mut string).unwrap();
@@ -165,7 +181,7 @@ unsafe extern "C" fn zcblive_initialize() {
     }));
 
     #[cfg(not(feature = "geode"))]
-    BOT.maybe_alloc_console();
+    unsafe { with_bot(|bot| bot.maybe_alloc_console()) };
 
     #[cfg(feature = "geode")]
     let _ = simple_logger::SimpleLogger::new().init();
@@ -174,7 +190,7 @@ unsafe extern "C" fn zcblive_initialize() {
     init_gl_hook();
 
     // init bot
-    BOT.init();
+    unsafe { with_bot(|bot| bot.init()) };
 }
 
 #[cfg(not(feature = "geode"))]
@@ -198,8 +214,10 @@ unsafe fn init_gl_hook() {
 #[no_mangle]
 unsafe extern "C" fn zcblive_uninitialize() {
     log::info!("saving config & env before detach...");
-    BOT.conf.save();
-    BOT.env.save();
+    with_bot(|bot| {
+        bot.conf.save();
+        bot.env.save();
+    });
 
     #[cfg(not(feature = "geode"))]
     let _ = hooks::disable_hooks().map_err(|e| log::error!("failed to disable hooks: {e}"));
@@ -209,7 +227,7 @@ unsafe extern "C" fn zcblive_uninitialize() {
         .disable()
         .map_err(|e| log::error!("failed to disable wglSwapBuffers: {e}"))
         .is_ok()
-        && BOT.conf.show_console
+        && with_bot(|bot| bot.conf.show_console)
     {
         let _ = FreeConsole().map_err(|e| log::error!("FreeConsole failed: {e}"));
     }
@@ -219,56 +237,56 @@ unsafe extern "C" fn zcblive_uninitialize() {
 
 #[no_mangle]
 unsafe extern "C" fn zcblive_on_action(button: u8, player2: bool, push: bool) {
-    BOT.on_action(Button::from_u8(button), player2, push);
+    with_bot(|bot| bot.on_action(Button::from_u8(button), player2, push));
 }
 
 /// optional implementation
 #[no_mangle]
 unsafe extern "C" fn zcblive_on_reset() {
-    BOT.on_reset();
+    with_bot(|bot| bot.on_reset());
 }
 
 #[no_mangle]
 unsafe extern "C" fn zcblive_set_is_in_level(is_in_level: bool) {
-    BOT.is_in_level = is_in_level;
+    with_bot(|bot| bot.is_in_level = is_in_level);
 }
 
 /// optional implementation
 #[no_mangle]
 unsafe extern "C" fn zcblive_set_playlayer_time(playlayer_time: f64) {
-    BOT.playlayer_time = playlayer_time;
+    with_bot(|bot| bot.playlayer_time = playlayer_time);
 }
 
 /// can pass NULL to `playlayer`
 #[no_mangle]
 unsafe extern "C" fn zcblive_on_init(playlayer: usize) {
-    BOT.on_init(playlayer);
+    with_bot(|bot| bot.on_init(playlayer));
 }
 
 /// equivalent to passing NULL to `zcblive_on_init`. optional implementation
 #[no_mangle]
 unsafe extern "C" fn zcblive_on_quit() {
-    BOT.on_exit();
+    with_bot(|bot| bot.on_exit());
 }
 
 /// optional implementation
 #[no_mangle]
 unsafe extern "C" fn zcblive_on_death() {
-    BOT.on_death();
+    with_bot(|bot| bot.on_death());
 }
 
 #[no_mangle]
 unsafe extern "C" fn zcblive_do_force_player2_sounds() -> bool {
-    BOT.conf.force_player2_sounds
+    with_bot(|bot| bot.conf.force_player2_sounds)
 }
 
 #[no_mangle]
 unsafe extern "C" fn zcblive_do_use_alternate_hook() -> bool {
-    BOT.conf.use_alternate_hook
+    with_bot(|bot| bot.conf.use_alternate_hook)
 }
 
 /// required for release buttons on death
 #[no_mangle]
 unsafe extern "C" fn zcblive_on_update(dt: f32) {
-    BOT.on_update(dt);
+    with_bot(|bot| bot.on_update(dt));
 }
